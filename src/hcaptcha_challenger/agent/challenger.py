@@ -40,14 +40,13 @@ from hcaptcha_challenger.models import (
     INV,
 )
 from hcaptcha_challenger.models import ChallengeTypeEnum, CoordinateGrid
-from hcaptcha_challenger.prompts import match_user_prompt
+from hcaptcha_challenger.skills import SkillManager
 from hcaptcha_challenger.tools import (
     ImageClassifier,
-    ChallengeClassifier,
+    ChallengeRouter,
     SpatialPathReasoner,
     SpatialPointReasoner,
 )
-from hcaptcha_challenger.tools.challenge_classifier import ChallengeRouter
 
 
 def _generate_bezier_trajectory(
@@ -120,7 +119,7 @@ class AgentConfig(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_ignore_empty=True, extra="ignore")
 
     GEMINI_API_KEY: SecretStr = Field(
-        default_factory=lambda: os.environ.get("GEMINI_API_KEY", ""),
+        default_factory=lambda: SecretStr(os.environ.get("GEMINI_API_KEY", "")),
         description="Create API Key https://aistudio.google.com/app/apikey",
     )
 
@@ -163,9 +162,6 @@ class AgentConfig(BaseSettings):
         description="When your local network is poor, increase this value appropriately [unit: millisecond]",
     )
 
-    CONSTRAINT_RESPONSE_SCHEMA: bool = Field(
-        default=True, description="Whether to enable constraint encoding"
-    )
     CHALLENGE_CLASSIFIER_MODEL: FastShotModelType = Field(
         default=DEFAULT_FAST_SHOT_MODEL,
         description="For the challenge classification task \n"
@@ -183,28 +179,21 @@ class AgentConfig(BaseSettings):
         description="For the challenge type: `image_drag_drop` (single/multi)",
     )
 
-    IMAGE_CLASSIFIER_THINKING_BUDGET: int = Field(
-        default=970,
-        description="Indicates the thinking budget in tokens. 0 is DISABLED. -1 is AUTOMATIC. The default values and allowed ranges are model dependent.",
-        le=32768,
-        ge=-1,
-    )
-    SPATIAL_POINT_THINKING_BUDGET: int = Field(
-        default=1387,
-        description="Indicates the thinking budget in tokens. 0 is DISABLED. -1 is AUTOMATIC. The default values and allowed ranges are model dependent.",
-        le=32768,
-        ge=-1,
-    )
-    SPATIAL_PATH_THINKING_BUDGET: int = Field(
-        default=-1,
-        description="Indicates the thinking budget in tokens. 0 is DISABLED. -1 is AUTOMATIC. The default values and allowed ranges are model dependent.",
-        le=32768,
-        ge=-1,
-    )
-
     coordinate_grid: CoordinateGrid | None = Field(default_factory=CoordinateGrid)
 
     enable_challenger_debug: bool | None = Field(default=False, description="Enable debug mode")
+
+    # == Skills Configuration == #
+    custom_skills_path: Path | None = Field(
+        default=None, description="Path to custom skills rules.yaml"
+    )
+    enable_skills_update: bool = Field(
+        default=True, description="Enable auto-update of skills from GitHub"
+    )
+    skills_update_repo: str = Field(
+        default="QIN2DIM/hcaptcha-challenger", description="GitHub repo for skills update"
+    )
+    skills_update_branch: str = Field(default="main", description="GitHub branch for skills update")
 
     @field_validator('GEMINI_API_KEY', mode="before")
     @classmethod
@@ -290,10 +279,6 @@ class RoboticArm:
         self.config = config
         self._debug = config.enable_challenger_debug
 
-        self._challenge_classifier = ChallengeClassifier(
-            gemini_api_key=self.config.GEMINI_API_KEY.get_secret_value(),
-            model=self.config.CHALLENGE_CLASSIFIER_MODEL,
-        )
         self._challenge_router = ChallengeRouter(
             gemini_api_key=self.config.GEMINI_API_KEY.get_secret_value(),
             model=self.config.CHALLENGE_CLASSIFIER_MODEL,
@@ -301,18 +286,16 @@ class RoboticArm:
         self._image_classifier = ImageClassifier(
             gemini_api_key=self.config.GEMINI_API_KEY.get_secret_value(),
             model=self.config.IMAGE_CLASSIFIER_MODEL,
-            constraint_response_schema=self.config.CONSTRAINT_RESPONSE_SCHEMA,
         )
         self._spatial_path_reasoner = SpatialPathReasoner(
             gemini_api_key=self.config.GEMINI_API_KEY.get_secret_value(),
             model=self.config.SPATIAL_PATH_REASONER_MODEL,
-            constraint_response_schema=self.config.CONSTRAINT_RESPONSE_SCHEMA,
         )
         self._spatial_point_reasoner = SpatialPointReasoner(
             gemini_api_key=self.config.GEMINI_API_KEY.get_secret_value(),
             model=self.config.SPATIAL_POINT_REASONER_MODEL,
-            constraint_response_schema=self.config.CONSTRAINT_RESPONSE_SCHEMA,
         )
+        self._skill_manager = SkillManager(agent_config=config)
         self.signal_crumb_count: int | None = None
         self.captcha_payload: CaptchaPayload | None = None
         self._challenge_prompt: str | None = None
@@ -388,8 +371,6 @@ class RoboticArm:
         return None
 
     def _match_user_prompt(self, job_type: ChallengeTypeEnum) -> str:
-        user_prompt = ""
-
         try:
             challenge_prompt = (
                 self.captcha_payload.get_requester_question()
@@ -397,20 +378,24 @@ class RoboticArm:
                 else self._challenge_prompt
             )
             if challenge_prompt and isinstance(challenge_prompt, str):
-                user_prompt = match_user_prompt(job_type, challenge_prompt)
+                return self._skill_manager.get_skill(challenge_prompt, job_type)
         except Exception as e:
             logger.warning(f"Error while processing captcha payload: {e}")
 
-        if not user_prompt:
-            user_prompt = f"Please note that the current task type is: {job_type.value}"
-
-        return user_prompt
+        return f"Please note that the current task type is: {job_type.value}"
 
     async def click_by_mouse(self, locator: Locator):
         bbox = await locator.bounding_box()
+        if bbox is None:
+            raise ValueError("Element is not visible or does not exist")
 
-        center_x = bbox['x'] + bbox['width'] / 2
-        center_y = bbox['y'] + bbox['height'] / 2
+        x: float = bbox['x']
+        y: float = bbox['y']
+        width: float = bbox['width']
+        height: float = bbox['height']
+
+        center_x = x + width / 2
+        center_y = y + height / 2
 
         await self.page.mouse.move(center_x, center_y)
 
@@ -462,9 +447,7 @@ class RoboticArm:
             cache_path = self.config.cache_dir.joinpath(f"challenge_view/_artifacts/{uuid4()}.png")
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             await challenge_view.screenshot(type="png", path=cache_path)
-            router_result = await self._challenge_router.invoke_async(
-                challenge_screenshot=cache_path
-            )
+            router_result = await self._challenge_router(challenge_screenshot=cache_path)
             self._challenge_prompt = router_result.challenge_prompt
             return router_result.challenge_type
         return None
@@ -510,6 +493,7 @@ class RoboticArm:
         # Capture challenge-view
         challenge_view = frame_challenge.locator("//div[@class='challenge-view']")
         challenge_screenshot = cache_key.joinpath(f"{cache_key.name}_{crumb_id}_challenge_view.png")
+        challenge_screenshot.parent.mkdir(parents=True, exist_ok=True)
         await challenge_view.screenshot(type="png", path=challenge_screenshot)
 
         challenge_view = frame_challenge.locator("//div[@class='challenge-view']")
@@ -603,10 +587,7 @@ class RoboticArm:
             await challenge_view.screenshot(type="png", path=challenge_screenshot)
 
             # Image classification
-            response = await self._image_classifier.invoke_async(
-                challenge_screenshot=challenge_screenshot,
-                thinking_budget=self.config.IMAGE_CLASSIFIER_THINKING_BUDGET,
-            )
+            response = await self._image_classifier(challenge_screenshot=challenge_screenshot)
             boolean_matrix = response.convert_box_to_boolean_matrix()
 
             logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
@@ -643,11 +624,10 @@ class RoboticArm:
 
             user_prompt = self._match_user_prompt(job_type)
 
-            response = await self._spatial_path_reasoner.invoke_async(
+            response = await self._spatial_path_reasoner(
                 challenge_screenshot=raw,
                 grid_divisions=projection,
                 auxiliary_information=user_prompt,
-                thinking_budget=self.config.SPATIAL_PATH_THINKING_BUDGET,
             )
             logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
             self._spatial_path_reasoner.cache_response(
@@ -674,11 +654,10 @@ class RoboticArm:
 
             user_prompt = self._match_user_prompt(job_type)
 
-            response = await self._spatial_point_reasoner.invoke_async(
+            response = await self._spatial_point_reasoner(
                 challenge_screenshot=raw,
                 grid_divisions=projection,
                 auxiliary_information=user_prompt,
-                thinking_budget=self.config.SPATIAL_POINT_THINKING_BUDGET,
             )
             logger.debug(f'[{cid+1}/{crumb_count}]ToolInvokeMessage: {response.log_message}')
             self._spatial_point_reasoner.cache_response(

@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from enum import Enum
 from typing import Literal, List, Dict, Any, Union
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+# Known Unicode homoglyphs mapping (legacy, kept for reference)
 BAD_CODE = {
     "а": "a",
     "е": "e",
@@ -39,11 +41,42 @@ BAD_CODE = {
     "\u006c": "l",
     "\u0399": "I",
     "\u0392": "B",
+    "\u03a1": "P",  # Greek Rho -> Latin P
     "ー": "一",
     "土": "士",
 }
 
 INV = {"\\", "/", ":", "*", "?", "<", ">", "|", "\n"}
+
+
+def normalize_unicode_text(text: str) -> str:
+    """
+    Normalize Unicode text to ASCII-safe string for file paths.
+
+    This function applies a three-layer defense against Unicode homoglyphs:
+    1. NFKC normalization - converts compatibility characters to canonical forms
+    2. BAD_CODE mapping - replaces known homoglyphs with ASCII equivalents
+    3. ASCII fallback - removes any remaining non-ASCII characters
+
+    Args:
+        text: The input text that may contain Unicode homoglyphs
+
+    Returns:
+        A normalized ASCII-safe string suitable for file paths
+    """
+    # Layer 1: NFKC normalization (handles many compatibility characters)
+    # e.g., fullwidth letters, circled letters, superscripts, etc.
+    result = unicodedata.normalize("NFKC", text)
+
+    # Layer 2: Apply known homoglyph mappings
+    for bad_char, good_char in BAD_CODE.items():
+        result = result.replace(bad_char, good_char)
+
+    # Layer 3: ASCII-only fallback for any remaining non-ASCII characters
+    # This ensures the path will always be valid on all file systems
+    result = "".join(c if ord(c) < 128 else "_" for c in result)
+
+    return result
 
 
 class ChallengeSignal(str, Enum):
@@ -110,7 +143,7 @@ class CaptchaTask(BaseModel):
 class CaptchaPayload(BaseModel):
     key: str = Field(default="")
     request_config: CaptchaRequestConfig | dict = Field(default_factory=dict)
-    request_type: RequestType = Field(default="")
+    request_type: RequestType | None = Field(default=None)
     requester_question: Dict[str, str] | None = Field(default_factory=dict)
     requester_restricted_answer_set: Dict[str, Any] | None = Field(default_factory=dict)
     requester_question_example: List[str] | str | None = Field(default=None)
@@ -121,9 +154,7 @@ class CaptchaPayload(BaseModel):
 
     def get_requester_question(self, language: str = "en") -> str:
         rq = self.requester_question.get(language, "unknown")
-        for i in BAD_CODE:
-            rq = rq.replace(i, BAD_CODE[i])
-        return rq
+        return normalize_unicode_text(rq)
 
 
 class CaptchaResponse(BaseModel):
@@ -193,6 +224,12 @@ class ChallengeTypeEnum(str, Enum):
     IMAGE_DRAG_MULTI = "image_drag_multi"
 
 
+# Type alias for skill rule job_type field - mirrors ChallengeTypeEnum values
+JobTypeLiteral = Literal[
+    "image_label_single_select", "image_label_multi_select", "image_drag_single", "image_drag_multi"
+]
+
+
 IGNORE_REQUEST_TYPE_LITERAL = Literal[
     "image_label_binary",
     "image_label_area_select",
@@ -209,6 +246,10 @@ SCoTModelType = Union[
     Literal[
         # This model is not available in the free plan.
         # Recommended for production environments for more tolerant rate limits.
+        # [✨] https://ai.google.dev/gemini-api/docs/models?hl=zh-cn#gemini-3-pro
+        "gemini-3-pro-preview",
+        # https://ai.google.dev/gemini-api/docs/models?hl=zh-cn#gemini-3-flash
+        "gemini-3-flash-preview",
         # [✨] https://ai.google.dev/gemini-api/docs/models#gemini-2.5-pro
         "gemini-2.5-pro",
         # [🤷‍♂️] https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash
@@ -233,6 +274,13 @@ DEFAULT_FAST_SHOT_MODEL: FastShotModelType = "gemini-2.5-flash"
 THINKING_BUDGET_MODELS: List[Union[SCoTModelType, FastShotModelType]] = [
     "gemini-2.5-flash",
     "gemini-2.5-pro",
+]
+
+THINKING_LEVEL_MODELS: List[str] = [
+    "gemini-3-pro-preview",
+    "gemini-3-pro",
+    "gemini-3-flash",
+    "gemini-3-flash-preview",
 ]
 
 
@@ -340,7 +388,6 @@ class SpatialPath(BaseModel):
 
 class ImageDragDropChallenge(BaseModel):
     challenge_prompt: str
-    inferred_rule: str
     paths: List[SpatialPath]
 
     @property
@@ -352,11 +399,7 @@ class ImageDragDropChallenge(BaseModel):
             }
             for i in self.paths
         ]
-        bundle = {
-            "Challenge Prompt": self.challenge_prompt,
-            "Inferred Rule": self.inferred_rule,
-            "Coordinates": str(_coordinates),
-        }
+        bundle = {"Challenge Prompt": self.challenge_prompt, "Coordinates": str(_coordinates)}
         return json.dumps(bundle, indent=2, ensure_ascii=False)
 
     def get_approximate_paths(self, bbox) -> List[SpatialPath]:

@@ -8,8 +8,8 @@ import dotenv
 import pytest
 
 from hcaptcha_challenger import FastShotModelType, ChallengeClassifier, ChallengeTypeEnum
-from hcaptcha_challenger.models import DEFAULT_FAST_SHOT_MODEL
-from hcaptcha_challenger.tools.challenge_classifier import ChallengeRouter
+from hcaptcha_challenger.models import DEFAULT_FAST_SHOT_MODEL, ChallengeRouterResult
+from hcaptcha_challenger.tools.challenge_router import ChallengeRouter
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -103,7 +103,7 @@ class TestChallengeClassifier:
         return ChallengeClassifier(gemini_api_key=api_key)
 
     @pytest.mark.parametrize("image_file, expected_type_enum", generate_individual_test_cases())
-    def test_challenge_classifier(
+    async def test_challenge_classifier(
         self,
         classifier: ChallengeClassifier,
         image_file: Path,
@@ -111,18 +111,18 @@ class TestChallengeClassifier:
     ):
         """Test challenge classification for a single image file."""
 
-        actual_challenge_type = classifier.invoke(image_file, model=TEST_MODEL)
+        result = await classifier(challenge_screenshot=image_file, model=TEST_MODEL)
 
-        assert isinstance(actual_challenge_type, ChallengeTypeEnum), (
+        assert isinstance(result, ChallengeRouterResult), (
             f"Classifier for '{image_file.name}' returned type "
-            f"{type(actual_challenge_type).__name__} instead of ChallengeTypeEnum. "
-            f"Value: {actual_challenge_type}"
+            f"{type(result).__name__} instead of ChallengeRouterResult. "
+            f"Value: {result}"
         )
 
-        assert actual_challenge_type == expected_type_enum, (
+        assert result.challenge_type == expected_type_enum, (
             f"Failed classification for '{image_file.name}': "
             f"Expected {expected_type_enum.name}, "
-            f"got {actual_challenge_type.name if isinstance(actual_challenge_type, ChallengeTypeEnum) else actual_challenge_type}"
+            f"got {result.challenge_type.name if isinstance(result.challenge_type, ChallengeTypeEnum) else result.challenge_type}"
         )
 
 
@@ -148,6 +148,6 @@ async def test_challenge_classifier():
     for g in groups:
         for t in groups[g]:
             s = random.choice(groups[g][t]["samples"])
-            result = await challenge_router.invoke_async(s)
+            result = await challenge_router(challenge_screenshot=s)
             assert result.challenge_prompt
             assert result.challenge_type == groups[g][t]["type"]
